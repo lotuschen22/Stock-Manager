@@ -1,0 +1,393 @@
+<template>
+  <van-config-provider theme="dark">
+    <div class="app-container">
+      
+      <van-nav-bar
+        title="贵州茅台 (600519)"
+        left-arrow
+        fixed
+        placeholder
+        @click-left="showToast('返回列表')"
+      >
+        <template #right>
+          <van-icon name="search" size="18" />
+        </template>
+      </van-nav-bar>
+
+      <div class="market-header">
+        <div class="price-box" :class="getColor(latest.change)">
+          <span class="current-price">{{ latest.close }}</span>
+          <div class="fluctuation">
+            <span class="percent">{{ latest.changePercent }}%</span>
+            <span class="amount">{{ latest.change > 0 ? '+' : '' }}{{ latest.change.toFixed(2) }}</span>
+          </div>
+        </div>
+        <div class="detail-grid">
+          <div class="grid-item"><span>高</span> {{ latest.high }}</div>
+          <div class="grid-item"><span>开</span> {{ latest.open }}</div>
+          <div class="grid-item"><span>低</span> {{ latest.low }}</div>
+          <div class="grid-item"><span>量</span> {{ (latest.volume / 10000).toFixed(0) }}万</div>
+        </div>
+      </div>
+
+      <div class="chart-wrapper">
+        <div class="chart-tabs">
+          <span class="active">日K</span>
+          <span>周K</span>
+          <span>月K</span>
+          <span>1分</span>
+        </div>
+        <div ref="chartRef" class="echarts-container"></div>
+      </div>
+
+      <div class="ai-card">
+        <div class="ai-header">
+          <div class="ai-title">
+            <span class="robot-icon">🤖</span>
+            <span>Gemini Pro 策略分析</span>
+          </div>
+          <transition name="van-fade">
+            <div v-if="aiResult" class="signal-tag" :class="aiResult.signal">
+              {{ formatSignal(aiResult.signal) }}
+            </div>
+          </transition>
+        </div>
+
+        <div class="ai-body">
+          <div v-if="loadingAI" class="loading-state">
+            <van-loading type="spinner" color="#1989fa" size="24px" vertical>
+              正在读取盘面与资金流向...
+            </van-loading>
+          </div>
+          
+          <div v-else-if="aiResult" class="analysis-content">
+            <p>{{ aiResult.summary }}</p>
+            <div class="meta-info">
+              <span>置信度: High</span>
+              <span>来源: 财联社/盘面</span>
+            </div>
+          </div>
+
+          <div v-else class="empty-state">
+            点击下方按钮，激活 AI 交易员进行深度分析
+          </div>
+        </div>
+      </div>
+
+      <div class="action-bar-placeholder"></div>
+      <div class="action-bar">
+        <div class="action-left">
+          <div class="action-icon"><van-icon name="star-o" />自选</div>
+          <div class="action-icon"><van-icon name="bell" />预警</div>
+        </div>
+        <van-button 
+          round 
+          block 
+          class="ai-btn"
+          color="linear-gradient(to right, #606c88, #3f4c6b)"
+          :loading="loadingAI"
+          @click="fetchAIAnalysis"
+        >
+          ✨ 生成 AI 交易策略
+        </van-button>
+      </div>
+
+    </div>
+  </van-config-provider>
+</template>
+
+<script setup>
+import { ref, onMounted, computed, onUnmounted } from 'vue';
+import * as echarts from 'echarts';
+import { showToast } from 'vant';
+
+// --- 1. 模拟数据 (真实开发请替换为 API 请求) ---
+// 为了代码简洁，这里只放最近几天的模拟数据
+const rawData = [
+  {"date":"2026-01-20","open":1379.5,"close":1373.55,"high":1381.58,"low":1372.05,"volume":36484},
+  {"date":"2026-01-21","open":1373.56,"close":1351.06,"high":1374.4,"low":1350.0,"volume":64516},
+  {"date":"2026-01-22","open":1352.01,"close":1340.06,"high":1361.76,"low":1337.48,"volume":59011},
+  {"date":"2026-01-23","open":1340.1,"close":1337.0,"high":1348.0,"low":1332.47,"volume":61949},
+  {"date":"2026-01-26","open":1340.51,"close":1342.0,"high":1355.0,"low":1325.12,"volume":80166},
+  {"date":"2026-01-27","open":1344.98,"close":1343.01,"high":1353.7,"low":1338.0,"volume":48416},
+  {"date":"2026-01-28","open":1343.04,"close":1323.69,"high":1346.71,"low":1322.01,"volume":76218},
+  {"date":"2026-01-29","open":1335.0,"close":1437.72,"high":1445.0,"low":1329.06,"volume":189534},
+  {"date":"2026-01-30","open":1435.0,"close":1401.0,"high":1435.0,"low":1401.0,"volume":94480},
+  {"date":"2026-02-02","open":1425.0,"close":1427.0,"high":1458.58,"low":1411.62,"volume":85724},
+  {"date":"2026-02-03","open":1445.0,"close":1474.92,"high":1476.81,"low":1443.03,"volume":86321},
+  {"date":"2026-02-04","open":1485.0,"close":1525.0,"high":1533.27,"low":1474.0,"volume":109123},
+  {"date":"2026-02-05","open":1520.0,"close":1555.0,"high":1565.0,"low":1515.0,"volume":91623},
+  {"date":"2026-02-06","open":1555.0,"close":1515.01,"high":1568.0,"low":1505.88,"volume":78965},
+  {"date":"2026-02-09","open":1518.0,"close":1524.96,"high":1542.88,"low":1513.49,"volume":51168}
+];
+
+// --- 2. 状态管理 ---
+const chartRef = ref(null);
+let myChart = null;
+const loadingAI = ref(false);
+const aiResult = ref(null);
+
+// 计算最新行情展示
+const latest = computed(() => {
+  const last = rawData[rawData.length - 1];
+  const prev = rawData[rawData.length - 2];
+  const change = last.close - prev.close;
+  return {
+    ...last,
+    change,
+    changePercent: ((change / prev.close) * 100).toFixed(2)
+  };
+});
+
+// 辅助函数：红涨绿跌
+const getColor = (val) => val >= 0 ? 'text-red' : 'text-green';
+
+// --- 3. ECharts 初始化逻辑 ---
+const initChart = () => {
+  if (!chartRef.value) return;
+  myChart = echarts.init(chartRef.value);
+  
+  const dates = rawData.map(i => i.date);
+  const dataValues = rawData.map(i => [i.open, i.close, i.low, i.high]);
+  
+  // 计算均线
+  const calculateMA = (dayCount) => {
+    return dataValues.map((item, i) => {
+      if (i < dayCount) return '-';
+      let sum = 0;
+      for (let j = 0; j < dayCount; j++) sum += dataValues[i - j][1];
+      return (sum / dayCount).toFixed(2);
+    });
+  };
+
+  const option = {
+    backgroundColor: 'transparent',
+    grid: { left: '2%', right: '2%', bottom: '2%', top: '10%', containLabel: false },
+    xAxis: { 
+      type: 'category', 
+      data: dates, 
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { show: false } // 极简模式，隐藏X轴日期
+    },
+    yAxis: { 
+      scale: true, 
+      splitLine: { show: true, lineStyle: { color: '#333', width: 0.5 } },
+      axisLabel: { inside: true, color: '#666', fontSize: 10 }
+    },
+    series: [
+      {
+        type: 'candlestick',
+        data: dataValues,
+        itemStyle: {
+          color: '#FD1050',
+          color0: '#0CF49B',
+          borderColor: '#FD1050',
+          borderColor0: '#0CF49B'
+        }
+      },
+      { type: 'line', data: calculateMA(5), smooth: true, lineStyle: { opacity: 0.5, color: '#fff' } }
+    ]
+  };
+  
+  myChart.setOption(option);
+};
+
+// --- 4. AI 核心交互 ---
+const fetchAIAnalysis = async () => {
+  loadingAI.value = true;
+  aiResult.value = null;
+
+  try {
+    // 【对接指南】：
+    // 真实环境请取消注释下方代码，并替换你的后端地址
+    // const res = await fetch(`http://your-python-api.com/api/analyze?code=600519`);
+    // const data = await res.json();
+    
+    // 模拟网络请求延迟
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    
+    // 模拟 Gemini 返回结果
+    // 随机生成一个信号，让你看到颜色变化效果
+    const randomSignal = Math.random() > 0.5 ? 'bullish' : 'bearish';
+    
+    aiResult.value = {
+      summary: randomSignal === 'bullish' 
+        ? "股价回踩 20 日均线获得支撑，成交量温和放大，主力资金净流入 2.1 亿。MACD 即将金叉，建议关注上方 1550 压力位。" 
+        : "当前股价在高位出现顶背离形态，RSI 指标超买。受行业集采消息影响，短期情绪偏空，建议减仓避险，下方支撑位看 1480。",
+      signal: randomSignal
+    };
+    
+  } catch (e) {
+    showToast('AI 分析服务暂时不可用');
+  } finally {
+    loadingAI.value = false;
+  }
+};
+
+const formatSignal = (s) => {
+  const map = { bullish: '🚀 积极看多', bearish: '⚠️ 风险警示', neutral: '⚖️ 中性观望' };
+  return map[s] || s;
+};
+
+// --- 生命周期 ---
+onMounted(() => {
+  initChart();
+  window.addEventListener('resize', () => myChart?.resize());
+});
+onUnmounted(() => {
+  window.removeEventListener('resize', () => myChart?.resize());
+});
+</script>
+
+<style scoped>
+/* 样式部分 */
+.app-container {
+  min-height: 100vh;
+  background-color: #121212;
+  color: #fff;
+  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  padding-bottom: 80px;
+}
+
+/* 顶部与行情 */
+.market-header {
+  padding: 16px 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.current-price {
+  font-size: 36px;
+  font-weight: 700;
+  line-height: 1;
+}
+.fluctuation {
+  display: flex;
+  gap: 10px;
+  margin-top: 6px;
+  font-size: 14px;
+  font-weight: 500;
+}
+.text-red { color: #FD1050; }
+.text-green { color: #0CF49B; }
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 12px;
+  font-size: 12px;
+  color: #888;
+}
+.grid-item span { color: #555; margin-right: 4px; }
+
+/* 图表区域 */
+.chart-wrapper {
+  margin-top: 10px;
+  border-bottom: 1px solid #222;
+}
+.chart-tabs {
+  display: flex;
+  padding: 0 16px;
+  gap: 24px;
+  font-size: 14px;
+  color: #666;
+  margin-bottom: 10px;
+}
+.chart-tabs .active {
+  color: #fff;
+  font-weight: bold;
+  position: relative;
+}
+.chart-tabs .active::after {
+  content: '';
+  position: absolute;
+  bottom: -4px;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  background: #fff;
+}
+.echarts-container {
+  width: 100%;
+  height: 300px;
+}
+
+/* AI 卡片 (核心亮点) */
+.ai-card {
+  margin: 20px 16px;
+  background: #1e1e1e;
+  border-radius: 16px;
+  padding: 20px;
+  border: 1px solid #333;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+}
+.ai-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.ai-title {
+  font-size: 16px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #E0E0E0;
+}
+.robot-icon { font-size: 20px; animation: float 3s ease-in-out infinite; }
+@keyframes float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-4px)} }
+
+.signal-tag {
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.signal-tag.bullish { background: rgba(253, 16, 80, 0.15); color: #FD1050; border: 1px solid rgba(253, 16, 80, 0.3); }
+.signal-tag.bearish { background: rgba(12, 244, 155, 0.15); color: #0CF49B; border: 1px solid rgba(12, 244, 155, 0.3); }
+
+.ai-body {
+  min-height: 80px;
+  background: #161616;
+  border-radius: 12px;
+  padding: 16px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: #ccc;
+}
+.loading-state { padding: 20px 0; text-align: center; }
+.empty-state { color: #555; text-align: center; padding-top: 20px; }
+.meta-info {
+  margin-top: 12px;
+  font-size: 12px;
+  color: #555;
+  display: flex;
+  gap: 12px;
+}
+
+/* 底部操作栏 */
+.action-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  background: #1e1e1e;
+  padding: 10px 16px 20px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  box-shadow: 0 -4px 12px rgba(0,0,0,0.2);
+  z-index: 99;
+}
+.action-left {
+  display: flex;
+  gap: 20px;
+  color: #888;
+  font-size: 10px;
+  text-align: center;
+}
+.action-icon { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.ai-btn { flex: 1; font-weight: bold; letter-spacing: 1px; }
+</style>

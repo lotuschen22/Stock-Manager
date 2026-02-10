@@ -1,0 +1,5 @@
+﻿fastapi
+uvicorn
+akshare
+google-generativeai
+python-dotenv
