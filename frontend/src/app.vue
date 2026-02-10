@@ -2,7 +2,7 @@
   <van-config-provider theme="dark">
     <div class="app-container">
       <van-nav-bar
-        :title="`股票看盘 (${symbol})`"
+        :title="`${stockName} (${symbol})`"
         left-arrow
         fixed
         placeholder
@@ -33,9 +33,14 @@
 
       <div class="chart-wrapper">
         <div class="chart-tabs">
-          <span class="active">日线</span>
-          <span>周线</span>
-          <span>月线</span>
+          <span
+            v-for="tab in chartTabs"
+            :key="tab.key"
+            :class="{ active: activeTab === tab.key }"
+            @click="selectTab(tab.key)"
+          >
+            {{ tab.label }}
+          </span>
         </div>
         <div ref="chartRef" class="echarts-container"></div>
       </div>
@@ -44,7 +49,7 @@
         <div class="ai-header">
           <div class="ai-title">
             <span class="robot-icon">AI</span>
-            <span>Gemini 趋势分析</span>
+            <span>{{ aiResult?.source === "local" ? "本地策略分析" : "Gemini 趋势分析" }}</span>
           </div>
           <div v-if="aiResult" class="signal-tag" :class="aiResult.signal">
             {{ formatSignal(aiResult.signal) }}
@@ -59,6 +64,8 @@
           </div>
           <div v-else-if="aiResult" class="analysis-content">
             <p>{{ aiResult.summary }}</p>
+            <p class="analysis-meta">模型：{{ formatModelUsed(aiResult.model_used) }}</p>
+            <p v-if="aiResult.note" class="analysis-note">{{ aiResult.note }}</p>
           </div>
           <div v-else class="empty-state">
             点击下方按钮，调用后端 AI 分析接口。
@@ -77,7 +84,7 @@
           class="ai-btn"
           color="linear-gradient(to right, #4f5d75, #2d3142)"
           :loading="loadingAI"
-          @click="analyzeTrend"
+          @click="handleAnalyze"
         >
           生成 AI 分析
         </van-button>
@@ -95,15 +102,26 @@ import { useStockDashboard } from "./features/stocks/useStockDashboard";
 
 const {
   symbol,
+  stockName,
   dailyData,
+  intraday1Data,
+  intraday5Data,
   latest,
   aiResult,
   loadingAI,
   loadAll,
+  loadIntraday,
   analyzeTrend,
 } = useStockDashboard();
 
 const chartRef = ref(null);
+const activeTab = ref("time");
+const chartTabs = [
+  { key: "time", label: "分时" },
+  { key: "1m", label: "1分" },
+  { key: "5m", label: "5分" },
+  { key: "day", label: "日线" },
+];
 let chart = null;
 let resizeHandler = null;
 
@@ -130,6 +148,12 @@ function formatSignal(signal) {
   return map[signal] || signal;
 }
 
+function formatModelUsed(modelUsed) {
+  if (!modelUsed) return "未知";
+  if (modelUsed === "local") return "本地策略";
+  return modelUsed;
+}
+
 function calcMA(values, dayCount) {
   return values.map((_, i) => {
     if (i < dayCount) return "-";
@@ -141,10 +165,30 @@ function calcMA(values, dayCount) {
   });
 }
 
-function renderChart() {
-  if (!chartRef.value || dailyData.value.length === 0) return;
-  if (!chart) chart = echarts.init(chartRef.value);
+function hasMiddayBreak(prevTime, nextTime) {
+  return prevTime <= "11:30" && nextTime >= "13:00";
+}
 
+function renderChart() {
+  if (!chartRef.value) return;
+  if (!chart) chart = echarts.init(chartRef.value);
+  if (activeTab.value === "time") {
+    renderTimeChart();
+    return;
+  }
+  if (activeTab.value === "1m") {
+    renderMinuteKChart(intraday1Data.value, "MA10");
+    return;
+  }
+  if (activeTab.value === "5m") {
+    renderMinuteKChart(intraday5Data.value, "MA5");
+    return;
+  }
+  renderDayKChart();
+}
+
+function renderDayKChart() {
+  if (dailyData.value.length === 0) return;
   const dates = dailyData.value.map((i) => i.date);
   const values = dailyData.value.map((i) => [
     Number(i.open),
@@ -153,7 +197,119 @@ function renderChart() {
     Number(i.high),
   ]);
 
-  chart.setOption({
+  chart.setOption(buildKlineOption(dates, values, calcMA(values, 5), "MA5"), true);
+}
+
+function renderMinuteKChart(data, maLabel) {
+  if (!data || data.length === 0) return;
+  const points = data
+    .map((i) => {
+      let open = Number(i.open);
+      const close = Number(i.close);
+      let high = Number(i.high);
+      let low = Number(i.low);
+      if (!(close > 0)) return null;
+      if (!(open > 0)) open = close;
+      if (!(high > 0)) high = Math.max(open, close);
+      if (!(low > 0)) low = Math.min(open, close);
+      high = Math.max(high, open, close, low);
+      low = Math.min(low, open, close, high);
+      return { t: String(i.datetime).slice(11, 16), o: open, c: close, l: low, h: high };
+    })
+    .filter(Boolean);
+  if (points.length === 0) return;
+
+  const rawDates = points.map((i) => i.t);
+  const rawValues = points.map((i) => [i.o, i.c, i.l, i.h]);
+  const maCount = maLabel === "MA10" ? 10 : 5;
+  const rawMa = calcMA(rawValues, maCount);
+
+  const dates = [];
+  const values = [];
+  const maData = [];
+  for (let i = 0; i < rawDates.length; i += 1) {
+    dates.push(rawDates[i]);
+    values.push(rawValues[i]);
+    maData.push(rawMa[i]);
+
+    const nextTime = rawDates[i + 1];
+    if (nextTime && hasMiddayBreak(rawDates[i], nextTime)) {
+      dates.push("休市");
+      values.push(["-", "-", "-", "-"]);
+      maData.push("-");
+    }
+  }
+
+  chart.setOption(buildKlineOption(dates, values, maData, maLabel), true);
+}
+
+function renderTimeChart() {
+  if (!intraday1Data.value || intraday1Data.value.length === 0) return;
+  const points = intraday1Data.value
+    .map((i) => ({ t: String(i.datetime).slice(11, 16), p: Number(i.close) }))
+    .filter((i) => i.p > 0);
+  if (points.length === 0) return;
+
+  const dates = [];
+  const prices = [];
+  for (let i = 0; i < points.length; i += 1) {
+    dates.push(points[i].t);
+    prices.push(points[i].p);
+
+    const next = points[i + 1];
+    if (next && hasMiddayBreak(points[i].t, next.t)) {
+      dates.push("休市");
+      prices.push(null);
+    }
+  }
+  const baseline = prices[0] || 0;
+
+  chart.setOption(
+    {
+      backgroundColor: "transparent",
+      grid: { left: "3%", right: "3%", bottom: "8%", top: "8%", containLabel: false },
+      xAxis: {
+        type: "category",
+        data: dates,
+        axisLine: { show: false },
+        axisTick: { show: false },
+        axisLabel: { color: "#666", fontSize: 10, interval: 60 },
+      },
+      yAxis: {
+        type: "value",
+        scale: true,
+        splitLine: { show: true, lineStyle: { color: "#333", width: 0.5 } },
+        axisLabel: { color: "#666", fontSize: 10 },
+      },
+      series: [
+        {
+          type: "line",
+          data: prices,
+          smooth: true,
+          connectNulls: false,
+          symbol: "none",
+          lineStyle: { width: 1.5, color: "#4da3ff" },
+          areaStyle: {
+            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: "rgba(77,163,255,0.28)" },
+              { offset: 1, color: "rgba(77,163,255,0.02)" },
+            ]),
+          },
+          markLine: {
+            silent: true,
+            symbol: "none",
+            lineStyle: { color: "#555", type: "dashed" },
+            data: [{ yAxis: baseline }],
+          },
+        },
+      ],
+    },
+    true,
+  );
+}
+
+function buildKlineOption(dates, values, maData, maLabel) {
+  return {
     backgroundColor: "transparent",
     grid: { left: "2%", right: "2%", bottom: "2%", top: "10%", containLabel: false },
     xAxis: {
@@ -170,6 +326,7 @@ function renderChart() {
     },
     series: [
       {
+        name: "K",
         type: "candlestick",
         data: values,
         itemStyle: {
@@ -180,21 +337,71 @@ function renderChart() {
         },
       },
       {
+        name: maLabel,
         type: "line",
-        data: calcMA(values, 5),
+        data: maData,
         smooth: true,
-        lineStyle: { opacity: 0.5, color: "#fff" },
+        symbol: "none",
+        lineStyle: { opacity: 0.55, color: "#fff" },
       },
     ],
-  });
+  };
 }
 
-watch(dailyData, () => {
+async function selectTab(tabKey) {
+  activeTab.value = tabKey;
+  if (tabKey === "time" || tabKey === "1m") {
+    await loadIntraday("1");
+  } else if (tabKey === "5m") {
+    await loadIntraday("5");
+  }
+  renderChart();
+}
+
+function currentAnalyzePayload() {
+  if (activeTab.value === "day") {
+    return {
+      symbol: symbol.value,
+      timeframe: "day",
+      data: dailyData.value.slice(-30),
+    };
+  }
+  if (activeTab.value === "5m") {
+    return {
+      symbol: symbol.value,
+      timeframe: "5m",
+      data: intraday5Data.value.slice(-180),
+    };
+  }
+  if (activeTab.value === "1m") {
+    return {
+      symbol: symbol.value,
+      timeframe: "1m",
+      data: intraday1Data.value.slice(-180),
+    };
+  }
+  return {
+    symbol: symbol.value,
+    timeframe: "time",
+    data: intraday1Data.value.slice(-180),
+  };
+}
+
+async function handleAnalyze() {
+  const payload = currentAnalyzePayload();
+  if (!payload.data || payload.data.length < 5) {
+    showToast("当前图表数据不足，无法分析");
+    return;
+  }
+  await analyzeTrend(payload);
+}
+
+watch([dailyData, intraday1Data, intraday5Data, activeTab], () => {
   renderChart();
 });
 
 onMounted(async () => {
-  await loadAll();
+  await Promise.allSettled([loadAll(), loadIntraday("1")]);
   renderChart();
   resizeHandler = () => chart?.resize();
   window.addEventListener("resize", resizeHandler);
@@ -272,6 +479,11 @@ onUnmounted(() => {
   font-size: 14px;
   color: #666;
   margin-bottom: 10px;
+  user-select: none;
+}
+
+.chart-tabs span {
+  cursor: pointer;
 }
 
 .chart-tabs .active {
@@ -364,6 +576,18 @@ onUnmounted(() => {
   font-size: 14px;
   line-height: 1.6;
   color: #ccc;
+}
+
+.analysis-note {
+  margin-top: 8px;
+  color: #888;
+  font-size: 12px;
+}
+
+.analysis-meta {
+  margin-top: 8px;
+  color: #9aa4b2;
+  font-size: 12px;
 }
 
 .loading-state {

@@ -2,17 +2,25 @@ import { computed, ref } from "vue";
 import { showToast } from "vant";
 
 import { DEFAULT_SYMBOL } from "../../constants/api";
-import { fetchAnalyze, fetchDaily, fetchRealtime } from "../../services/api/stocks";
+import {
+  fetchAnalyze,
+  fetchDaily,
+  fetchIntraday,
+  fetchRealtime,
+} from "../../services/api/stocks";
 
 export function useStockDashboard() {
   const symbol = ref(DEFAULT_SYMBOL);
   const dailyData = ref([]);
+  const intraday1Data = ref([]);
+  const intraday5Data = ref([]);
   const realtime = ref(null);
   const aiResult = ref(null);
 
   const loadingDaily = ref(false);
   const loadingRealtime = ref(false);
   const loadingAI = ref(false);
+  const loadingIntraday = ref(false);
 
   const latest = computed(() => {
     if (realtime.value?.price != null) {
@@ -55,6 +63,14 @@ export function useStockDashboard() {
     };
   });
 
+  const stockName = computed(() => {
+    const name = realtime.value?.name;
+    if (typeof name === "string" && name.trim()) {
+      return name.trim();
+    }
+    return symbol.value;
+  });
+
   async function loadDaily() {
     loadingDaily.value = true;
     try {
@@ -79,11 +95,11 @@ export function useStockDashboard() {
     }
   }
 
-  async function analyzeTrend() {
+  async function analyzeTrend(payload) {
     loadingAI.value = true;
     aiResult.value = null;
     try {
-      aiResult.value = await fetchAnalyze(symbol.value);
+      aiResult.value = await fetchAnalyze(payload);
     } catch (error) {
       showToast(`AI 分析失败: ${error.message}`);
       aiResult.value = null;
@@ -92,19 +108,42 @@ export function useStockDashboard() {
     }
   }
 
+  async function loadIntraday(period) {
+    const key = String(period);
+    const target = key === "5" ? intraday5Data : intraday1Data;
+    if (target.value.length > 0) return;
+
+    loadingIntraday.value = true;
+    try {
+      target.value = await fetchIntraday(symbol.value, key);
+    } catch (error) {
+      showToast(`${key}分钟图加载失败: ${error.message}`);
+      target.value = [];
+    } finally {
+      loadingIntraday.value = false;
+    }
+  }
+
   async function loadAll() {
-    await Promise.all([loadDaily(), loadRealtime()]);
+    await loadDaily();
+    // Do not block first paint on realtime endpoint.
+    loadRealtime();
   }
 
   return {
     symbol,
     dailyData,
+    intraday1Data,
+    intraday5Data,
+    stockName,
     latest,
     aiResult,
     loadingDaily,
     loadingRealtime,
     loadingAI,
+    loadingIntraday,
     loadAll,
+    loadIntraday,
     analyzeTrend,
   };
 }
