@@ -1,5 +1,8 @@
 fastapi
 uvicorn
 akshare
+pandas
+numpy
 google-genai
 python-dotenv
+pypinyin
