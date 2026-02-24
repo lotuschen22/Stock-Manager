@@ -1,24 +1,17 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
 import threading
-import time
 from pathlib import Path
 from typing import Dict, List
 
-import akshare as ak
 from fastapi import HTTPException
 
 DEFAULT_SYMBOL = "sh600549"
 _STORE_PATH = Path(__file__).resolve().parent.parent / "data" / "watchlist.json"
 _LOCK = threading.Lock()
 _SYMBOL_RE = re.compile(r"(sh|sz)?\d{6}", re.IGNORECASE)
-_NAME_CACHE_TTL_SECONDS = 3600
-_NAME_CACHE: Dict[str, object] = {
-    "expires_at": 0.0,
-    "name_map": {},
-}
 
 
 def normalize_symbol_input(raw: str) -> str:
@@ -52,7 +45,7 @@ def load_watchlist() -> Dict:
 
 def upsert_item(symbol: str, name: str | None = None) -> Dict:
     normalized_symbol = normalize_symbol_input(symbol)
-    normalized_name = _normalize_name(name) or _lookup_name_by_symbol(normalized_symbol)
+    normalized_name = _normalize_name(name)
 
     with _LOCK:
         data = _normalize_store(_read_store_unlocked())
@@ -120,12 +113,12 @@ def _normalize_store(data: Dict | None) -> Dict:
             items.append(
                 {
                     "symbol": normalized_symbol,
-                    "name": _normalize_name(item.get("name")) or _lookup_name_by_symbol(normalized_symbol),
+                    "name": _normalize_name(item.get("name")),
                 }
             )
 
     if not items:
-        items = [{"symbol": DEFAULT_SYMBOL, "name": _lookup_name_by_symbol(DEFAULT_SYMBOL)}]
+        items = [{"symbol": DEFAULT_SYMBOL, "name": None}]
 
     selected_symbol = payload.get("selected_symbol")
     try:
@@ -147,59 +140,6 @@ def _normalize_name(name: str | None) -> str | None:
         return None
     text = str(name).strip()
     return text or None
-
-
-def _lookup_name_by_symbol(symbol: str) -> str | None:
-    if not symbol or len(symbol) < 8:
-        return None
-    code = symbol[-6:]
-    if not code.isdigit():
-        return None
-    name_map = _load_name_map()
-    value = name_map.get(code)
-    return _normalize_name(value)
-
-
-def _load_name_map() -> Dict[str, str]:
-    now = time.time()
-    expires_at = float(_NAME_CACHE.get("expires_at") or 0.0)
-    cached = _NAME_CACHE.get("name_map")
-    if now < expires_at and isinstance(cached, dict) and cached:
-        return cached
-
-    try:
-        df = ak.stock_info_a_code_name()
-    except Exception:
-        return cached if isinstance(cached, dict) else {}
-
-    columns = [str(col).strip().lower() for col in df.columns]
-    code_col = None
-    name_col = None
-    for idx, col in enumerate(columns):
-        if col in {"code", "代码"} and code_col is None:
-            code_col = df.columns[idx]
-        if col in {"name", "名称"} and name_col is None:
-            name_col = df.columns[idx]
-
-    if code_col is None or name_col is None:
-        if len(df.columns) >= 2:
-            code_col = df.columns[0]
-            name_col = df.columns[1]
-        else:
-            return cached if isinstance(cached, dict) else {}
-
-    name_map: Dict[str, str] = {}
-    for _, row in df.iterrows():
-        code = str(row.get(code_col) or "").strip()
-        name = str(row.get(name_col) or "").strip()
-        if len(code) == 6 and code.isdigit() and name:
-            name_map[code] = name
-
-    if name_map:
-        _NAME_CACHE["name_map"] = name_map
-        _NAME_CACHE["expires_at"] = now + _NAME_CACHE_TTL_SECONDS
-        return name_map
-    return cached if isinstance(cached, dict) else {}
 
 
 def _read_store_unlocked() -> Dict:

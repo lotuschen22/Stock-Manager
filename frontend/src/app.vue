@@ -20,12 +20,24 @@
               <div class="watch-item-name">{{ item.name || item.symbol }}</div>
               <div class="watch-item-code">{{ item.symbol }}</div>
             </div>
+            <div class="watch-item-quote" :class="quoteClass(item.symbol)">
+              <div class="watch-item-price">{{ formatWatchPrice(item.symbol) }}</div>
+              <div class="watch-item-change">{{ formatWatchChange(item.symbol) }}</div>
+            </div>
+            <div v-if="watchSignal(item.symbol)" class="watch-signal-badge" :class="watchSignal(item.symbol)">
+              {{ watchSignal(item.symbol) }}
+            </div>
             <van-icon name="cross" class="watch-remove" @click.stop="handleRemoveSymbol(item.symbol)" />
           </button>
         </div>
       </aside>
 
       <div class="app-container">
+        <div v-if="showLoadingMask" class="loading-mask">
+          <van-loading type="spinner" color="#4da3ff" size="32px" vertical>
+            数据加载中...
+          </van-loading>
+        </div>
         <van-nav-bar
           :title="`${stockName} (${symbol})`"
           left-arrow
@@ -45,6 +57,8 @@
               <span class="percent">{{ latest.changePercent }}%</span>
               <span class="amount">{{ formatChange(latest.change) }}</span>
             </div>
+            <div v-if="selectedQuoteTime" class="quote-time">行情时间 {{ selectedQuoteTime }}</div>
+            <div v-if="marketServerTime" class="quote-time">服务器时间 {{ marketServerTime }} ({{ marketPhase }})</div>
           </div>
           <div class="detail-grid">
             <div class="grid-item"><span>高</span> {{ formatNumber(latest.high) }}</div>
@@ -96,8 +110,10 @@
 
         <div class="action-bar">
           <div class="action-left">
-            <div class="action-icon"><van-icon name="star-o" /> 自选</div>
-            <div class="action-icon"><van-icon name="bell" /> 预警</div>
+            <button type="button" class="action-icon action-mute" @click="toggleAlertMuted">
+              <van-icon :name="alertMuted ? 'volume-o' : 'bell'" />
+              {{ alertMuted ? "静音" : "预警" }}
+            </button>
           </div>
           <van-button
             round
@@ -152,7 +168,7 @@
 </template>
 
 <script setup>
-import { onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as echarts from "echarts";
 import { showToast } from "vant";
 
@@ -164,20 +180,34 @@ const {
   watchlist,
   stockName,
   dailyData,
+  timelineData,
   intraday1Data,
   intraday5Data,
   intraday1Signals,
   intraday5Signals,
   latest,
   aiResult,
+  marketBySymbol,
+  marketServerTime,
+  marketPhase,
+  signalAlerts,
+  alertMuted,
+  loadingRealtime,
+  loadingIntraday,
   loadingAI,
   loadingWatchlist,
   loadWatchlist,
   selectSymbol,
   addSymbol,
   removeSymbol,
+  loadDaily,
+  loadTimeline,
   loadIntraday,
+  loadSignalOnly,
   analyzeTrend,
+  consumeSignalAlert,
+  toggleAlertMuted,
+  disconnectMarketSocket,
 } = useStockDashboard();
 
 const chartRef = ref(null);
@@ -188,6 +218,7 @@ const addingSymbol = ref(false);
 const searchingStocks = ref(false);
 const searchResults = ref([]);
 let searchTimer = null;
+let searchRequestSeq = 0;
 const chartTabs = [
   { key: "time", label: "分时" },
   { key: "1m", label: "1分" },
@@ -196,6 +227,17 @@ const chartTabs = [
 ];
 let chart = null;
 let resizeHandler = null;
+let intradayRefreshTimer = null;
+let timelineRefreshTimer = null;
+let signalRefreshTimer = null;
+const showLoadingMask = computed(
+  () => loadingWatchlist.value,
+);
+const selectedQuoteTime = computed(() => {
+  const item = getWatchMarket(symbol.value);
+  return item?.updatedAt ? String(item.updatedAt) : "";
+});
+const selectedMarketQuote = computed(() => getWatchMarket(symbol.value));
 
 function getColor(value) {
   return value >= 0 ? "text-red" : "text-green";
@@ -224,6 +266,37 @@ function formatModelUsed(modelUsed) {
   if (!modelUsed) return "未知";
   if (modelUsed === "local") return "本地策略";
   return modelUsed;
+}
+
+function getWatchMarket(symbolKey) {
+  const key = String(symbolKey || "").toLowerCase();
+  return marketBySymbol.value[key] || null;
+}
+
+function formatWatchPrice(symbolKey) {
+  const item = getWatchMarket(symbolKey);
+  if (!item || !Number.isFinite(item.price)) return "--";
+  return Number(item.price).toFixed(2);
+}
+
+function formatWatchChange(symbolKey) {
+  const item = getWatchMarket(symbolKey);
+  if (!item || !Number.isFinite(item.changePercent)) return "--";
+  const n = Number(item.changePercent);
+  return `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
+}
+
+function quoteClass(symbolKey) {
+  const item = getWatchMarket(symbolKey);
+  const n = Number(item?.changePercent);
+  if (!Number.isFinite(n)) return "";
+  return n >= 0 ? "up" : "down";
+}
+
+function watchSignal(symbolKey) {
+  const item = getWatchMarket(symbolKey);
+  if (item?.signal === "B" || item?.signal === "S") return item.signal;
+  return "";
 }
 
 function calcMA(values, dayCount) {
@@ -355,15 +428,31 @@ function renderChart() {
   if (!chart) chart = echarts.init(chartRef.value);
 
   if (activeTab.value === "time") {
+    if (!timelineData.value || timelineData.value.length === 0) {
+      chart.clear();
+      return;
+    }
     renderTimeChart();
     return;
   }
   if (activeTab.value === "1m") {
+    if (!intraday1Data.value || intraday1Data.value.length === 0) {
+      chart.clear();
+      return;
+    }
     renderMinuteKChart(intraday1Data.value, intraday1Signals.value, "MA10");
     return;
   }
   if (activeTab.value === "5m") {
+    if (!intraday5Data.value || intraday5Data.value.length === 0) {
+      chart.clear();
+      return;
+    }
     renderMinuteKChart(intraday5Data.value, intraday5Signals.value, "MA5");
+    return;
+  }
+  if (!dailyData.value || dailyData.value.length === 0) {
+    chart.clear();
     return;
   }
   renderDayKChart();
@@ -449,18 +538,41 @@ function renderMinuteKChart(data, signals, maLabel) {
 }
 
 function renderTimeChart() {
-  if (!intraday1Data.value || intraday1Data.value.length === 0) return;
-  const points = intraday1Data.value
+  if (!timelineData.value || timelineData.value.length === 0) return;
+  const points = timelineData.value
     .map((i) => {
-      const rawDate = getTimeCell(i);
+      const rawDate = String(i.datetime || i.date || "");
       return {
         rawDate,
         t: rawDate.slice(11, 16),
-        p: Number(i.close),
+        p: Number(i.price),
+        a: Number(i.avg_price),
         v: Number(i.volume) || 0,
       };
     })
     .filter((i) => i.t && i.p > 0);
+  const liveQuote = selectedMarketQuote.value;
+  const livePrice = Number(liveQuote?.price);
+  const liveRawDate = String(liveQuote?.updatedAt || "");
+  const liveTime = liveRawDate.length >= 16 ? liveRawDate.slice(11, 16) : "";
+  if (Number.isFinite(livePrice) && liveTime) {
+    const index = points.findIndex((item) => item.t === liveTime);
+    if (index >= 0) {
+      points[index] = {
+        ...points[index],
+        rawDate: liveRawDate,
+        p: livePrice,
+      };
+    } else {
+      points.push({
+        rawDate: liveRawDate,
+        t: liveTime,
+        p: livePrice,
+        v: 0,
+      });
+      points.sort((a, b) => a.t.localeCompare(b.t));
+    }
+  }
   if (points.length === 0) return;
 
   const pointByTime = new Map();
@@ -504,6 +616,9 @@ function renderTimeChart() {
     volSum += Math.max(item.v, 0);
     amountSum += Math.max(item.p * item.v, 0);
     avgPrices.push(volSum > 0 ? amountSum / volSum : item.p);
+    if (Number.isFinite(item.a) && item.a > 0) {
+      avgPrices[avgPrices.length - 1] = item.a;
+    }
     riseFlags.push(lastPrice == null ? true : item.p >= lastPrice);
     lastPrice = item.p;
 
@@ -529,6 +644,9 @@ function renderTimeChart() {
   chart.setOption(
     {
       backgroundColor: "transparent",
+      animation: false,
+      animationDuration: 0,
+      animationDurationUpdate: 0,
       grid: [
         { left: "4%", right: "6%", top: "8%", height: "63%" },
         { left: "4%", right: "6%", top: "76%", height: "15%" },
@@ -712,10 +830,17 @@ function buildKlineOption(dates, values, maData, maLabel, markPoints = []) {
 
 async function selectTab(tabKey) {
   activeTab.value = tabKey;
-  if (tabKey === "time" || tabKey === "1m") {
+  if (tabKey === "time") {
+    await loadTimeline(undefined, true);
+  } else if (tabKey === "1m") {
     await loadIntraday("1");
   } else if (tabKey === "5m") {
-    await loadIntraday("5");
+    await loadIntraday("5", undefined, true);
+    if (!intraday5Data.value || intraday5Data.value.length === 0) {
+      showToast("5分数据暂不可用");
+    }
+  } else if (tabKey === "day" && (!dailyData.value || dailyData.value.length === 0)) {
+    await loadDaily();
   }
   renderChart();
 }
@@ -745,7 +870,18 @@ function currentAnalyzePayload() {
   return {
     symbol: symbol.value,
     timeframe: "time",
-    data: intraday1Data.value.slice(-180),
+    data: timelineData.value.slice(-180).map((item) => {
+      const price = Number(item?.price || 0);
+      const volume = Number(item?.volume || 0);
+      return {
+        datetime: String(item?.datetime || ""),
+        open: price,
+        close: price,
+        high: price,
+        low: price,
+        volume,
+      };
+    }),
   };
 }
 
@@ -760,11 +896,11 @@ async function handleAnalyze() {
 
 async function handleSelectSymbol(nextSymbol) {
   if (nextSymbol === symbol.value) return;
-  await selectSymbol(nextSymbol);
+  await selectSymbol(nextSymbol, activeTab.value);
 }
 
 async function handleRemoveSymbol(nextSymbol) {
-  await removeSymbol(nextSymbol);
+  await removeSymbol(nextSymbol, activeTab.value);
 }
 
 async function handleAddSymbol() {
@@ -776,7 +912,7 @@ async function handleAddSymbol() {
 
   addingSymbol.value = true;
   try {
-    const ok = await addSymbol(text);
+    const ok = await addSymbol(text, activeTab.value);
     if (ok) {
       pendingInput.value = "";
       showAddPopup.value = false;
@@ -788,6 +924,7 @@ async function handleAddSymbol() {
 
 async function executeSearch(keyword) {
   const q = String(keyword || "").trim();
+  const reqSeq = ++searchRequestSeq;
   if (!q) {
     searchResults.value = [];
     return;
@@ -795,10 +932,13 @@ async function executeSearch(keyword) {
   searchingStocks.value = true;
   try {
     const payload = await searchStocks(q, 12);
+    if (reqSeq !== searchRequestSeq) return;
     searchResults.value = Array.isArray(payload?.items) ? payload.items : [];
   } catch (error) {
+    if (reqSeq !== searchRequestSeq) return;
     searchResults.value = [];
   } finally {
+    if (reqSeq !== searchRequestSeq) return;
     searchingStocks.value = false;
   }
 }
@@ -807,7 +947,7 @@ async function handlePickSearch(item) {
   if (!item?.symbol) return;
   addingSymbol.value = true;
   try {
-    const ok = await addSymbol(item);
+    const ok = await addSymbol(item, activeTab.value);
     if (ok) {
       pendingInput.value = "";
       searchResults.value = [];
@@ -818,7 +958,20 @@ async function handlePickSearch(item) {
   }
 }
 
-watch([dailyData, intraday1Data, intraday5Data, intraday1Signals, intraday5Signals, activeTab], () => {
+watch([dailyData, timelineData, intraday1Data, intraday5Data, intraday1Signals, intraday5Signals, activeTab], () => {
+  renderChart();
+});
+
+watch(selectedQuoteTime, () => {
+  if (activeTab.value === "time" || activeTab.value === "1m") {
+    renderChart();
+  }
+});
+
+watch(symbol, () => {
+  if (chart) {
+    chart.clear();
+  }
   renderChart();
 });
 
@@ -831,21 +984,48 @@ watch(pendingInput, (value) => {
 
 watch(showAddPopup, (visible) => {
   if (!visible) {
+    searchRequestSeq += 1;
     pendingInput.value = "";
     searchResults.value = [];
     searchingStocks.value = false;
   }
 });
 
+watch(signalAlerts, (items) => {
+  if (!Array.isArray(items) || items.length === 0 || alertMuted.value) return;
+  const latestAlert = items[items.length - 1];
+  const direction = latestAlert.signal === "B" ? "买入信号" : "卖出信号";
+  showToast(`${latestAlert.name} 触发${direction} (${Number(latestAlert.price || 0).toFixed(2)})`);
+  consumeSignalAlert(latestAlert.id);
+});
+
 onMounted(async () => {
-  await loadWatchlist();
+  await loadWatchlist(activeTab.value);
   renderChart();
   resizeHandler = () => chart?.resize();
   window.addEventListener("resize", resizeHandler);
+  timelineRefreshTimer = setInterval(() => {
+    if (activeTab.value === "time") {
+      void loadTimeline(undefined, true);
+    }
+  }, 3000);
+  intradayRefreshTimer = setInterval(() => {
+    if (activeTab.value === "5m") {
+      void loadIntraday("5", undefined, true);
+    }
+  }, 15000);
+  signalRefreshTimer = setInterval(() => {
+    void loadSignalOnly("1", undefined, true);
+    void loadSignalOnly("5", undefined, true);
+  }, 20000);
 });
 
 onUnmounted(() => {
+  disconnectMarketSocket();
   if (searchTimer) clearTimeout(searchTimer);
+  if (timelineRefreshTimer) clearInterval(timelineRefreshTimer);
+  if (intradayRefreshTimer) clearInterval(intradayRefreshTimer);
+  if (signalRefreshTimer) clearInterval(signalRefreshTimer);
   if (resizeHandler) window.removeEventListener("resize", resizeHandler);
   if (chart) {
     chart.dispose();
@@ -909,6 +1089,7 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
 }
 
 .watch-item.active {
@@ -919,12 +1100,63 @@ onUnmounted(() => {
 .watch-item-name {
   font-size: 13px;
   font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.watch-item-main {
+  min-width: 0;
+  flex: 1;
 }
 
 .watch-item-code {
   margin-top: 3px;
   font-size: 11px;
   color: #8e99a8;
+}
+
+.watch-item-quote {
+  min-width: 74px;
+  text-align: right;
+  font-size: 11px;
+  line-height: 1.2;
+  color: #8e99a8;
+}
+
+.watch-item-price {
+  color: #dce3ee;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.watch-item-quote.up .watch-item-change {
+  color: #fd1050;
+}
+
+.watch-item-quote.down .watch-item-change {
+  color: #0cf49b;
+}
+
+.watch-signal-badge {
+  min-width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.watch-signal-badge.B {
+  background: rgba(12, 244, 155, 0.85);
+}
+
+.watch-signal-badge.S {
+  background: rgba(253, 16, 80, 0.85);
 }
 
 .watch-remove {
@@ -941,9 +1173,21 @@ onUnmounted(() => {
 .app-container {
   flex: 1;
   min-height: 100vh;
+  position: relative;
   color: #fff;
   font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
   padding-bottom: 80px;
+}
+
+.loading-mask {
+  position: absolute;
+  inset: 46px 0 0 0;
+  z-index: 88;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 12, 18, 0.48);
+  backdrop-filter: blur(2px);
 }
 
 .market-header {
@@ -965,6 +1209,12 @@ onUnmounted(() => {
   margin-top: 6px;
   font-size: 14px;
   font-weight: 500;
+}
+
+.quote-time {
+  margin-top: 6px;
+  font-size: 12px;
+  opacity: 0.7;
 }
 
 .text-red {
@@ -1149,6 +1399,14 @@ onUnmounted(() => {
   flex-direction: column;
   align-items: center;
   gap: 4px;
+}
+
+.action-mute {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
 }
 
 .ai-btn {

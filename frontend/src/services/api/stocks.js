@@ -11,6 +11,7 @@ export function fetchRealtime(symbol) {
 export function fetchAnalyze(payload) {
   return request("/analyze", {
     method: "POST",
+    timeoutMs: 30000,
     body: JSON.stringify(payload),
   });
 }
@@ -20,12 +21,27 @@ export function fetchIntraday(symbol, period = "1") {
   return request(`/intraday/${encodeURIComponent(symbol)}?${query.toString()}`);
 }
 
+export function fetchTimeline(code) {
+  const query = new URLSearchParams({
+    code: String(code),
+  });
+  return request(`/api/timeline?${query.toString()}`);
+}
+
 export function fetchKline(code, period = "daily") {
   const query = new URLSearchParams({
     code: String(code),
     period: String(period),
   });
   return request(`/api/kline?${query.toString()}`);
+}
+
+export function fetchSignals(code, period = "1") {
+  const query = new URLSearchParams({
+    code: String(code),
+    period: String(period),
+  });
+  return request(`/api/signals?${query.toString()}`);
 }
 
 export function fetchWatchlist() {

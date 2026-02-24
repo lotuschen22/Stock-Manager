@@ -36,13 +36,25 @@ def get_stock_data(symbol: str, period: str) -> pd.DataFrame:
             )
             df = _normalize_ohlcv_df(raw, time_key="date")
         else:
+            primary_error: Exception | None = None
+            df = pd.DataFrame()
             try:
                 raw = _fetch_minute_data_with_retry(symbol=code, period=period)
-            except Exception:
-                # Eastmoney minute endpoint can intermittently fail in some networks.
-                # Fallback to Sina minute endpoint to keep chart requests available.
-                raw = _fetch_minute_data_from_sina(symbol=symbol_with_exchange, period=period)
-            df = _normalize_ohlcv_df(raw, time_key="date")
+                df = _normalize_ohlcv_df(raw, time_key="date")
+            except Exception as exc:
+                primary_error = exc
+
+            should_try_fallback = primary_error is not None or _needs_fresher_intraday(df)
+            if should_try_fallback:
+                # Eastmoney minute endpoint can intermittently fail or lag in some sessions.
+                # Fallback to Sina minute endpoint and prefer fresher data when available.
+                fallback_raw = _fetch_minute_data_from_sina(symbol=symbol_with_exchange, period=period)
+                fallback_df = _normalize_ohlcv_df(fallback_raw, time_key="date")
+                if fallback_df.empty:
+                    if df.empty and primary_error is not None:
+                        raise primary_error
+                elif df.empty or _latest_datetime_text(fallback_df) >= _latest_datetime_text(df):
+                    df = fallback_df
     except HTTPException:
         raise
     except Exception as exc:
@@ -235,6 +247,19 @@ def build_kline_payload(symbol: str, period: str) -> Dict:
     return {"data": data, "signals": signals}
 
 
+def build_signal_payload(symbol: str, period: str) -> Dict:
+    df = get_stock_data(symbol=symbol, period=period)
+    df = calculate_macd(df)
+    df = calculate_kdj(df, period=9)
+    signals = analyze_strategy(df)
+
+    if df.empty:
+        return {"signals": []}
+    latest_day = str(df.iloc[-1]["date"])[:10]
+    latest_signals = [item for item in signals if str(item.get("date") or "").startswith(latest_day)]
+    return {"signals": latest_signals}
+
+
 def _normalize_symbol(symbol: str) -> str:
     code = symbol.strip().lower()
     if code.startswith(("sh", "sz")):
@@ -274,6 +299,39 @@ def _normalize_ohlcv_df(df: pd.DataFrame, time_key: str) -> pd.DataFrame:
     if all(ts.endswith("00:00:00") for ts in out[time_key].head(min(20, len(out)))):
         out[time_key] = out[time_key].str.slice(0, 10)
     return out
+
+
+def _needs_fresher_intraday(df: pd.DataFrame) -> bool:
+    if df is None or df.empty:
+        return True
+
+    latest_text = _latest_datetime_text(df)
+    if not latest_text:
+        return True
+
+    latest_day = latest_text[:10]
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    if latest_day >= today:
+        return False
+
+    # During regular weekday session, yesterday's minute bars are considered stale.
+    # Outside session (early morning / late evening), yesterday is acceptable.
+    if now.weekday() >= 5:
+        return False
+    hhmm = now.strftime("%H:%M")
+    return "09:31" <= hhmm <= "15:30"
+
+
+def _latest_datetime_text(df: pd.DataFrame) -> str:
+    if df is None or df.empty or "date" not in df.columns:
+        return ""
+    value = str(df.iloc[-1]["date"] or "").strip()
+    if not value:
+        return ""
+    if len(value) == 10:
+        return f"{value} 00:00:00"
+    return value
 
 
 def _detect_rename_map(df: pd.DataFrame) -> Dict[str, str]:

@@ -48,15 +48,22 @@ def analyze_stock_trend(data: List[Dict], timeframe: str = "day") -> Dict:
 
     primary_model = get_primary_model()
     fallback_model = get_fallback_model()
+    primary_timeout = 5
+    fallback_timeout = get_model_timeout_seconds()
     model_used = primary_model
 
     try:
-        text = _generate_model_text(prompt, primary_model, api_key)
+        text = _generate_model_text(prompt, primary_model, api_key, timeout_seconds=primary_timeout)
     except Exception as e:
         if _should_fallback(e):
             try:
                 model_used = fallback_model
-                text = _generate_model_text(prompt, fallback_model, api_key)
+                text = _generate_model_text(
+                    prompt,
+                    fallback_model,
+                    api_key,
+                    timeout_seconds=fallback_timeout,
+                )
             except Exception as fallback_error:
                 return _local_trend_analysis(data, _safe_error_message(fallback_error), model_used="local")
         else:
@@ -89,8 +96,14 @@ def analyze_stock_trend(data: List[Dict], timeframe: str = "day") -> Dict:
     }
 
 
-def _generate_model_text(prompt: str, model_name: str, api_key: str) -> str:
-    timeout = get_model_timeout_seconds()
+def _generate_model_text(
+    prompt: str,
+    model_name: str,
+    api_key: str,
+    timeout_seconds: int | float | None = None,
+) -> str:
+    timeout = float(timeout_seconds) if timeout_seconds is not None else float(get_model_timeout_seconds())
+    timeout = max(1.0, timeout)
     queue: mp.Queue = mp.Queue(maxsize=1)
     ctx = mp.get_context("spawn")
     process = ctx.Process(
@@ -123,7 +136,7 @@ def _model_request_worker(
     prompt: str,
     model_name: str,
     api_key: str,
-    timeout: int,
+    timeout: int | float,
 ) -> None:
     try:
         url = (

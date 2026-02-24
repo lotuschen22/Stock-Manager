@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import threading
 import time
+import unicodedata
 from typing import Dict, List
 
 import akshare as ak
@@ -11,15 +13,17 @@ try:
 except Exception:  # pragma: no cover
     lazy_pinyin = None
 
-_CACHE_TTL_SECONDS = 600
+_CACHE_TTL_SECONDS = 6 * 60 * 60
 _CACHE: Dict[str, object] = {
     "expires_at": 0.0,
     "items": [],
 }
+_CACHE_LOCK = threading.Lock()
+_CACHE_REFRESHING = False
 
 
 def search_stocks(query: str, limit: int = 20) -> List[Dict]:
-    q = str(query or "").strip().lower()
+    q = _normalize_query(query)
     if not q:
         return []
 
@@ -46,15 +50,54 @@ def search_stocks(query: str, limit: int = 20) -> List[Dict]:
 
 def _load_universe() -> List[Dict]:
     now = time.time()
-    expires_at = float(_CACHE.get("expires_at") or 0.0)
-    cached_items = _CACHE.get("items")
-    if now < expires_at and isinstance(cached_items, list) and cached_items:
-        return cached_items
+    with _CACHE_LOCK:
+        expires_at = float(_CACHE.get("expires_at") or 0.0)
+        cached_items = _CACHE.get("items")
+        has_cached = isinstance(cached_items, list) and bool(cached_items)
+        if has_cached and now < expires_at:
+            return cached_items
+        if has_cached:
+            _ensure_background_refresh()
+            return cached_items
 
     items = _fetch_universe()
-    _CACHE["items"] = items
-    _CACHE["expires_at"] = now + _CACHE_TTL_SECONDS
+    with _CACHE_LOCK:
+        _CACHE["items"] = items
+        _CACHE["expires_at"] = now + _CACHE_TTL_SECONDS
     return items
+
+
+def _ensure_background_refresh() -> None:
+    global _CACHE_REFRESHING
+    with _CACHE_LOCK:
+        if _CACHE_REFRESHING:
+            return
+        _CACHE_REFRESHING = True
+
+    thread = threading.Thread(target=_refresh_universe_worker, daemon=True)
+    thread.start()
+
+
+def _refresh_universe_worker() -> None:
+    global _CACHE_REFRESHING
+    try:
+        items = _fetch_universe()
+        with _CACHE_LOCK:
+            _CACHE["items"] = items
+            _CACHE["expires_at"] = time.time() + _CACHE_TTL_SECONDS
+    except Exception:
+        pass
+    finally:
+        with _CACHE_LOCK:
+            _CACHE_REFRESHING = False
+
+
+def warm_stock_universe() -> None:
+    try:
+        _load_universe()
+    except Exception:
+        # Warm-up should not block service startup.
+        return
 
 
 def _fetch_universe() -> List[Dict]:
@@ -95,6 +138,7 @@ def _fetch_universe() -> List[Dict]:
                 "symbol": symbol,
                 "name": name,
                 "name_lower": name.lower(),
+                "name_norm": _normalize_text(name),
                 "pinyin": full_pinyin,
                 "abbr": abbr_pinyin,
             }
@@ -125,11 +169,12 @@ def _to_pinyin(text: str) -> tuple[str, str]:
 
 
 def _score_item(item: Dict, q: str) -> int:
-    code = item["code"]
-    symbol = item["symbol"]
-    name_lower = item["name_lower"]
-    pinyin = item["pinyin"]
-    abbr = item["abbr"]
+    code = str(item["code"])
+    symbol = str(item["symbol"])
+    name_lower = str(item["name_lower"])
+    name_norm = str(item.get("name_norm") or "")
+    pinyin = str(item["pinyin"])
+    abbr = str(item["abbr"])
 
     score = 0
     if code == q or symbol == q:
@@ -147,6 +192,13 @@ def _score_item(item: Dict, q: str) -> int:
         score = max(score, 900)
     elif q in name_lower:
         score = max(score, 850)
+    elif name_norm:
+        if name_norm == q:
+            score = max(score, 950)
+        elif name_norm.startswith(q):
+            score = max(score, 900)
+        elif q in name_norm:
+            score = max(score, 850)
 
     if pinyin:
         if pinyin == q:
@@ -162,3 +214,13 @@ def _score_item(item: Dict, q: str) -> int:
             score = max(score, 720)
 
     return score
+
+
+def _normalize_query(text: str) -> str:
+    return _normalize_text(text)
+
+
+def _normalize_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    normalized = "".join(ch for ch in normalized if not ch.isspace())
+    return normalized.strip().lower()
